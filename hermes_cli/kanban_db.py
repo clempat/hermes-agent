@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Collection, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -6914,6 +6914,237 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
+
+
+def _verified_git_worktree(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    workspace = Path(path).expanduser()
+    if not workspace.is_dir():
+        return False
+    try:
+        git_env = {
+            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        }
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "rev-parse",
+                "--is-inside-work-tree",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+            env=git_env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    lines = (result.stdout or "").splitlines()
+    if result.returncode != 0 or len(lines) != 4 or lines[0].strip() != "true":
+        return False
+    git_dir, common_dir, top_level = (Path(line.strip()) for line in lines[1:])
+    return (
+        git_dir != common_dir
+        and git_dir.is_dir()
+        and common_dir.is_dir()
+        and top_level.resolve(strict=False) == workspace.resolve(strict=False)
+    )
+
+
+def controlled_nudge(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    signal: str,
+    rule: str,
+    reason: str,
+    resolved: bool = False,
+    read_back: Optional[str] = None,
+    allowed_auto_rules: Collection[str] = (),
+    cooldown_seconds: int = 86_400,
+    author: str = "kanban-nudge",
+) -> dict[str, str]:
+    """Nudge a blocker, auto-unblocking only a narrowly proven safe case.
+
+    The caller owns the deterministic read-only probe. This function owns the
+    Kanban safety policy, deduplication, and atomic audit trail. Human blockers,
+    unverified worktrees, and tasks with open children are never auto-unblocked.
+    """
+    signal = signal.strip()
+    rule = rule.strip()
+    reason = reason.strip()
+    read_back = (read_back or "").strip() or None
+    if not signal or not rule or not reason:
+        raise ValueError("signal, rule, and reason are required")
+    if cooldown_seconds < 0:
+        raise ValueError("cooldown_seconds must be non-negative")
+
+    now = int(time.time())
+    changed_status = False
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, block_kind, workspace_kind, workspace_path "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not task or task["status"] != "blocked":
+            return {
+                "action": "ignored",
+                "old_status": task["status"] if task else "missing",
+                "new_status": task["status"] if task else "missing",
+            }
+
+        last_block = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS id FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked'",
+            (task_id,),
+        ).fetchone()
+        previous_events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind IN ('blocker_nudged', 'auto_unblocked') "
+            "AND id > ? AND created_at > ? ORDER BY id DESC",
+            (task_id, int(last_block["id"]), now - cooldown_seconds),
+        ).fetchall()
+        for previous in previous_events:
+            try:
+                previous_payload = json.loads(previous["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if (
+                previous_payload.get("signal") == signal
+                and previous_payload.get("rule") == rule
+            ):
+                return {
+                    "action": "deduplicated",
+                    "old_status": "blocked",
+                    "new_status": "blocked",
+                }
+
+        classification_event = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind IN ("
+            "'blocked', 'unblocked', 'auto_unblocked', 'gave_up', "
+            "'protocol_violation', 'stale', 'timed_out', 'crashed', "
+            "'spawn_failed', 'rate_limited'"
+            ") ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            classification_payload = (
+                json.loads(classification_event["payload"] or "{}")
+                if classification_event
+                else {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            classification_payload = {}
+        if not isinstance(classification_payload, dict):
+            classification_payload = {}
+
+        block_kind = task["block_kind"]
+        if (
+            not classification_event
+            or classification_event["kind"] != "blocked"
+            or classification_payload.get("kind") != block_kind
+        ):
+            policy_reason = "current blocker was not explicitly classified"
+        elif block_kind not in {"transient", "capability"}:
+            policy_reason = "human blocker cannot be auto-unblocked"
+        elif not resolved:
+            policy_reason = "condition is not resolved"
+        elif not read_back:
+            policy_reason = "positive read-back is required"
+        elif rule not in set(allowed_auto_rules):
+            policy_reason = "rule is not allowlisted"
+        elif conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks c ON c.id = l.child_id "
+            "WHERE l.parent_id = ? AND c.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone():
+            policy_reason = "open children require review"
+        elif task["workspace_kind"] == "worktree" and not _verified_git_worktree(
+            task["workspace_path"]
+        ):
+            policy_reason = "worktree workspace is not verified"
+        else:
+            policy_reason = ""
+
+        old_status = "blocked"
+        if policy_reason:
+            new_status = old_status
+            event_kind = "blocker_nudged"
+            audit_reason = policy_reason
+            prefix = "NUDGE"
+        else:
+            _reclaim_dangling_run(
+                conn,
+                task_id,
+                statuses=("blocked",),
+                now=now,
+                note="invariant recovery on controlled auto-unblock",
+            )
+            resume_status = _resume_status_from_events(conn, task_id)
+            landing_status = _landing_status_after_parents(conn, task_id)
+            new_status = (
+                "review"
+                if landing_status == "ready" and resume_status == "review"
+                else landing_status
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'blocked'",
+                (new_status, task_id),
+            )
+            if cur.rowcount != 1:
+                return {
+                    "action": "ignored",
+                    "old_status": old_status,
+                    "new_status": old_status,
+                }
+            changed_status = True
+            event_kind = "auto_unblocked"
+            audit_reason = reason
+            prefix = "AUTO-UNBLOCK"
+
+        payload = {
+            "signal": signal,
+            "rule": rule,
+            "old_status": old_status,
+            "new_status": new_status,
+            "reason": audit_reason,
+        }
+        if event_kind == "auto_unblocked":
+            payload["read_back"] = read_back
+        _append_event(conn, task_id, event_kind, payload)
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                author,
+                f"{prefix}: signal={signal}; rule={rule}; "
+                f"{old_status}->{new_status}; reason={audit_reason}",
+                now,
+            ),
+        )
+
+    notify_task_updated(
+        conn, task_id, ("status", "comments") if changed_status else ("comments",)
+    )
+    return {
+        "action": "unblocked" if changed_status else "nudged",
+        "old_status": old_status,
+        "new_status": new_status,
+    }
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:

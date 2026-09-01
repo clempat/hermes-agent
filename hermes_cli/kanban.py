@@ -693,6 +693,39 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_nudge = sub.add_parser(
+        "nudge",
+        help="Audit a blocker and auto-unblock only with allowlisted positive read-back",
+    )
+    p_nudge.add_argument("task_id")
+    p_nudge.add_argument(
+        "--signal", required=True, help="Deterministic read-only observation"
+    )
+    p_nudge.add_argument(
+        "--rule",
+        required=True,
+        help="Probe rule name; auto-unblock requires config allowlisting",
+    )
+    p_nudge.add_argument(
+        "--reason",
+        required=True,
+        help="Why the observed signal resolves or still blocks the task",
+    )
+    p_nudge.add_argument(
+        "--resolved",
+        action="store_true",
+        help="The deterministic probe says the blocker cleared",
+    )
+    p_nudge.add_argument(
+        "--read-back", default=None, help="Positive access/service read-back evidence"
+    )
+    p_nudge.add_argument(
+        "--cooldown-seconds",
+        type=int,
+        default=None,
+        help="Dedupe window (minimum 300, default 86400)",
+    )
+
     p_request_review = sub.add_parser(
         "request-review",
         help="Move a task to 'review' (implementation done, awaiting review) — NOT a block",
@@ -1168,6 +1201,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "nudge":    _cmd_nudge,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -1236,6 +1270,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "block",
     "schedule",
     "unblock",
+    "nudge",
     "promote",
     "archive",
     "dispatch",
@@ -2513,6 +2548,52 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_nudge(args: argparse.Namespace) -> int:
+    from hermes_cli.config import load_config
+
+    kanban_config = load_config().get("kanban", {})
+    allowed_rules = kanban_config.get("auto_unblock_rules", [])
+    if not isinstance(allowed_rules, list) or not all(
+        isinstance(rule, str) for rule in allowed_rules
+    ):
+        allowed_rules = []
+    configured_cooldown = kanban_config.get("nudge_cooldown_seconds", 86_400)
+    requested_cooldown = getattr(args, "cooldown_seconds", None)
+    try:
+        cooldown = int(
+            configured_cooldown if requested_cooldown is None else requested_cooldown
+        )
+    except (TypeError, ValueError):
+        cooldown = 86_400
+    cooldown = max(300, cooldown)
+
+    with kb.connect_closing() as conn:
+        result = kb.controlled_nudge(
+            conn,
+            args.task_id,
+            signal=args.signal,
+            rule=args.rule,
+            reason=args.reason,
+            resolved=bool(args.resolved),
+            read_back=args.read_back,
+            allowed_auto_rules=allowed_rules,
+            cooldown_seconds=cooldown,
+            author=_profile_author(),
+        )
+    action = result["action"]
+    if action == "unblocked":
+        print(f"Auto-unblocked {args.task_id}: {result['old_status']}->{result['new_status']}")
+        return 0
+    if action == "nudged":
+        print(f"Nudged {args.task_id}; status remains {result['new_status']}")
+        return 0
+    if action == "deduplicated":
+        print(f"Skipped duplicate nudge for {args.task_id}")
+        return 0
+    print(f"Ignored nudge for {args.task_id}: task is {result['new_status']}")
+    return 1
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
