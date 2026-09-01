@@ -290,6 +290,39 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
+### Controlled blocker nudges
+
+Use `hermes kanban nudge` from an existing deterministic monitor instead of
+adding a second poller. The monitor performs the read-only service/access check;
+Kanban applies the state policy and audit trail:
+
+```yaml
+kanban:
+  auto_unblock_rules: [service-health]
+  nudge_cooldown_seconds: 86400
+```
+
+```bash
+hermes kanban nudge t_abc \
+  --signal "GET /health returned 200" \
+  --rule service-health \
+  --reason "dependency is reachable again" \
+  --resolved \
+  --read-back "HTTP 200 with expected body"
+```
+
+- `transient` and `capability` may auto-unblock only when the rule is explicitly
+  allowlisted, the probe says resolved, and positive read-back is recorded.
+- `needs_input`, legacy/untyped blockers, unresolved checks, protocol/workspace
+  failures, and tasks with open children are comment-only nudges.
+- `dependency` already waits in `todo` on the Kanban graph; do not poll it.
+- Worktree tasks must resolve through Git as a real linked worktree before any
+  automatic unblock. Git repository environment overrides are ignored during
+  this verification. The command never completes a task.
+- Every delivered nudge records signal, rule, old/new status, and reason in an
+  event and comment. Identical rule+signal pairs are deduplicated until the
+  configured cooldown expires; the CLI enforces a five-minute minimum.
+
 ## How workers interact with the board
 
 **Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in their toolsets config. These tools read and mutate the board directly via the Python `kanban_db` layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the `hermes kanban` CLI.
